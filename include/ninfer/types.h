@@ -34,6 +34,9 @@ enum class KvCacheStorage : std::uint8_t {
     // diagnostic; the sm_86 implementation is not yet ported to the kv_cache_append op that
     // now owns KV quantization. See docs/rtx-3090-windows.md.
     RotatedInt8KeyInt4ValueGroup64,
+    // Trellis-coded 3-bit, group 128. Two blocks cover one 256-wide row at 3.25 bits
+    // for each value. Ported from turbo3_tcq; see src/ops/kv_cache/tcq3_g128_codec.cuh.
+    Tcq3Group128,
 };
 
 enum class EnginePurpose : std::uint8_t {

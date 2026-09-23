@@ -11,6 +11,9 @@ namespace ninfer::targets::qwen3_6 {
 
 inline constexpr std::int32_t kKvInt8QuantGroup = 64;
 inline constexpr std::int32_t kKvFp8QuantGroup  = 256;
+inline constexpr std::int32_t kKvTcq3QuantGroup = 128;
+// One 49-byte trellis bitstream for each group of 128 values.
+inline constexpr std::int32_t kKvTcq3StreamBytes = 49;
 
 struct DecoderStateSpec {
     std::uint32_t full_attention_layers     = 0;

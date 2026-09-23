@@ -4,6 +4,8 @@
 #include "ninfer/ops/softmax_attention.h"
 #include "ops/op_tester.h"
 #include "ops/softmax_attention/oracle.h"
+#include "ops/kv_cache/tcq3_sign_words.h"
+#include "ops/softmax_attention/tcq3_host_tables.h"
 
 #include <algorithm>
 #include <array>
@@ -28,7 +30,12 @@ constexpr std::int32_t kQuantGroup     = 64;
 constexpr std::int32_t kQuantGroups    = kHeadDim / kQuantGroup;
 constexpr std::int32_t kFp8QuantGroup  = kHeadDim;
 constexpr std::int32_t kFp8QuantGroups = 1;
-constexpr float kAttentionScale        = 0.0625f;
+constexpr std::int32_t kTcq3Group       = kTcq3HostGroup;
+constexpr std::int32_t kTcq3Groups      = kHeadDim / kTcq3Group;
+constexpr std::int32_t kTcq3StreamBytes = kTcq3HostStreamBytes;
+constexpr std::int32_t kTcq3RowBytes    = kTcq3Groups * kTcq3StreamBytes;
+constexpr std::int32_t kTcq3States      = kTcq3HostStates;
+constexpr float kAttentionScale         = 0.0625f;
 constexpr std::uint16_t kOutputCanary  = 0x7fc1u;
 
 // The Op has two registered compute profiles. A1 and A3 use the same criterion for a given
@@ -46,6 +53,17 @@ constexpr ReductionCriterion kAttentionInt8Criterion{
 };
 
 constexpr ReductionCriterion kAttentionFp8Criterion{
+    /*relative_l2*/ 1.2e-2,
+    /*gross_absolute*/ 4.0e-3,
+    /*gross_relative_to_max_reference*/ 9.0e-3,
+};
+
+// TCQ3 rotates Q into BF16 and rotates the output accumulator back through BF16, and
+// neither rounding exists in the oracle, which reads exact Q and inverse-rotates the
+// decoded cache in float. Two extra 256-term BF16 transforms is what separates this
+// criterion from the INT8 one; the codec error itself is not measured here, because the
+// oracle reads the same decoded values the kernel does.
+constexpr ReductionCriterion kAttentionTcq3Criterion{
     /*relative_l2*/ 1.2e-2,
     /*gross_absolute*/ 4.0e-3,
     /*gross_relative_to_max_reference*/ 9.0e-3,
@@ -174,6 +192,34 @@ std::size_t fp8_scale_index(const Geometry& geometry, std::int32_t padded_contex
 
 std::size_t fp8_scale_elements(const Geometry& geometry, std::int32_t padded_context) {
     return static_cast<std::size_t>(padded_context) * static_cast<std::size_t>(geometry.kv_heads);
+}
+
+std::size_t tcq3_code_index(const Geometry& geometry, std::int32_t padded_context,
+                            std::int32_t head, std::int32_t position, std::int32_t group) {
+    (void)geometry;
+    return static_cast<std::size_t>(group * kTcq3StreamBytes) +
+           static_cast<std::size_t>(kTcq3RowBytes) *
+               (static_cast<std::size_t>(position) +
+                static_cast<std::size_t>(padded_context) * static_cast<std::size_t>(head));
+}
+
+std::size_t tcq3_norm_index(const Geometry& geometry, std::int32_t padded_context,
+                            std::int32_t head, std::int32_t position, std::int32_t group) {
+    (void)geometry;
+    return static_cast<std::size_t>(group) +
+           static_cast<std::size_t>(kTcq3Groups) *
+               (static_cast<std::size_t>(position) +
+                static_cast<std::size_t>(padded_context) * static_cast<std::size_t>(head));
+}
+
+std::size_t tcq3_code_elements(const Geometry& geometry, std::int32_t padded_context) {
+    return static_cast<std::size_t>(kTcq3RowBytes) * static_cast<std::size_t>(padded_context) *
+           static_cast<std::size_t>(geometry.kv_heads);
+}
+
+std::size_t tcq3_norm_elements(const Geometry& geometry, std::int32_t padded_context) {
+    return static_cast<std::size_t>(kTcq3Groups) * static_cast<std::size_t>(padded_context) *
+           static_cast<std::size_t>(geometry.kv_heads);
 }
 
 std::size_t paged_index(std::int32_t leading_extent, const Geometry& geometry,
@@ -383,11 +429,15 @@ struct HostCache {
     std::vector<std::int8_t> v_i8;
     std::vector<std::uint8_t> k_fp8;
     std::vector<std::uint8_t> v_fp8;
+    std::vector<std::uint8_t> k_tcq3;
+    std::vector<std::uint8_t> v_tcq3;
     std::vector<std::uint16_t> k_scale;
     std::vector<std::uint16_t> v_scale;
     // Original-coordinate logical K after decoding the private rotated quantized representation.
     // This is fixture input to the independent Attention oracle, not a production staging oracle.
     std::vector<float> logical_k_quantized;
+    // TCQ3 rotates the value plane too, so it needs the same treatment for V.
+    std::vector<float> logical_v_quantized;
 };
 
 void encode_group(std::span<const float> source, std::size_t source_base,
@@ -425,6 +475,162 @@ void normalized_hadamard_d256(std::array<float, kHeadDim>& values) {
         }
     }
     for (float& value : values) { value *= 0x1p-4f; }
+}
+
+// TCQ3 uses the randomized rotation when the kernels do, and the sign pattern comes from
+// the same header they read, so the oracle cannot drift from them. R = H . D is orthogonal
+// but not its own inverse, so undoing it is H then D, not H again.
+void tcq3_apply_signs(std::array<float, kHeadDim>& values) {
+    for (std::int32_t d = 0; d < kHeadDim; ++d) {
+        if (((ops::kTcq3SignWords[d / 32] >> (d % 32)) & 1u) != 0u) {
+            values[static_cast<std::size_t>(d)] = -values[static_cast<std::size_t>(d)];
+        }
+    }
+}
+
+void tcq3_rotate(std::array<float, kHeadDim>& values) {
+    if constexpr (ops::kTcq3SignRandomized) { tcq3_apply_signs(values); }
+    normalized_hadamard_d256(values);
+}
+
+void tcq3_unrotate(std::array<float, kHeadDim>& values) {
+    normalized_hadamard_d256(values);
+    if constexpr (ops::kTcq3SignRandomized) { tcq3_apply_signs(values); }
+}
+
+// Viterbi search over the turbo3_tcq trellis for one group of 128 rotated values. The
+// trellis shifts right, next = (prev >> 3) | (symbol << 6), so the best predecessor of a
+// state depends only on its low six bits: each step is 64 eight-way scans, not 512.
+void encode_tcq3_group(const float* values, bool key, std::uint8_t* stream,
+                       std::uint16_t* norm_bits) {
+    const float* codebook = key ? kTcq3HostCodebookK : kTcq3HostCodebookV;
+
+    float norm_squared = 0.0f;
+    for (std::int32_t i = 0; i < kTcq3Group; ++i) { norm_squared += values[i] * values[i]; }
+    const float group_norm = std::sqrt(norm_squared);
+    const float inverse    = group_norm > 1e-10f ? 1.0f / group_norm : 0.0f;
+    std::array<float, kTcq3Group> x{};
+    for (std::int32_t i = 0; i < kTcq3Group; ++i) {
+        x[static_cast<std::size_t>(i)] = values[i] * inverse;
+    }
+
+    std::array<float, kTcq3States> cost{};
+    std::array<float, kTcq3States> next{};
+    std::array<std::array<std::uint8_t, 64>, kTcq3Group> back{};
+    for (std::int32_t t = 0; t < kTcq3Group; ++t) {
+        std::array<float, 64> best{};
+        for (std::int32_t low = 0; low < 64; ++low) {
+            const std::size_t base = static_cast<std::size_t>(low) << 3;
+            float minimum          = cost[base];
+            std::int32_t argument  = 0;
+            for (std::int32_t p = 1; p < 8; ++p) {
+                if (cost[base | static_cast<std::size_t>(p)] < minimum) {
+                    minimum  = cost[base | static_cast<std::size_t>(p)];
+                    argument = p;
+                }
+            }
+            best[static_cast<std::size_t>(low)] = minimum;
+            back[static_cast<std::size_t>(t)][static_cast<std::size_t>(low)] =
+                static_cast<std::uint8_t>(argument);
+        }
+        for (std::int32_t state = 0; state < kTcq3States; ++state) {
+            const std::size_t index = static_cast<std::size_t>(state);
+            const float difference  = x[static_cast<std::size_t>(t)] - codebook[index];
+            next[index] = best[index & 0x3fU] + difference * difference;
+        }
+        cost = next;
+    }
+
+    float minimum     = cost[0];
+    std::int32_t last = 0;
+    for (std::int32_t state = 1; state < kTcq3States; ++state) {
+        if (cost[static_cast<std::size_t>(state)] < minimum) {
+            minimum = cost[static_cast<std::size_t>(state)];
+            last    = state;
+        }
+    }
+
+    std::array<std::uint8_t, kTcq3Group> symbols{};
+    std::int32_t state = last;
+    for (std::int32_t t = kTcq3Group - 1; t >= 0; --t) {
+        symbols[static_cast<std::size_t>(t)] = static_cast<std::uint8_t>(state >> 6);
+        const std::int32_t predecessor =
+            back[static_cast<std::size_t>(t)][static_cast<std::size_t>(state & 0x3f)];
+        state = ((state & 0x3f) << 3) | predecessor;
+    }
+    const std::int32_t initial_state = state;
+
+    // Rescale so the decoded group carries the energy the input group had.
+    float reconstructed = 0.0f;
+    std::int32_t walk   = initial_state;
+    for (std::int32_t t = 0; t < kTcq3Group; ++t) {
+        walk = (walk >> 3) | (static_cast<std::int32_t>(symbols[static_cast<std::size_t>(t)]) << 6);
+        reconstructed += codebook[static_cast<std::size_t>(walk)] *
+                         codebook[static_cast<std::size_t>(walk)];
+    }
+    const float reconstructed_norm = std::sqrt(reconstructed);
+    *norm_bits = f32_to_f16_bits(reconstructed_norm > 1e-10f ? group_norm / reconstructed_norm
+                                                             : group_norm);
+
+    std::fill_n(stream, kTcq3StreamBytes, static_cast<std::uint8_t>(0));
+    const std::int32_t initial_bits = (initial_state >> 3) & 0x3f;
+    for (std::int32_t bit = 0; bit < 6; ++bit) {
+        if (((initial_bits >> bit) & 1) != 0) {
+            stream[bit / 8] |= static_cast<std::uint8_t>(1u << (bit % 8));
+        }
+    }
+    for (std::int32_t t = 0; t < kTcq3Group; ++t) {
+        for (std::int32_t bit = 0; bit < 3; ++bit) {
+            if (((symbols[static_cast<std::size_t>(t)] >> bit) & 1) != 0) {
+                const std::int32_t position = 6 + t * 3 + bit;
+                stream[position / 8] |= static_cast<std::uint8_t>(1u << (position % 8));
+            }
+        }
+    }
+}
+
+// Nine bits at a symbol boundary index the codebook. The kernel holds its shared codebook
+// in FP16 and rounds each decoded value to BF16 before the matmul reads it, so the oracle
+// carries both roundings.
+float decode_tcq3_value(const std::uint8_t* stream, std::int32_t t, float norm, bool key) {
+    const std::int32_t bit  = t * 3;
+    const std::uint16_t raw = static_cast<std::uint16_t>(stream[bit >> 3]) |
+                              static_cast<std::uint16_t>(
+                                  static_cast<std::uint16_t>(stream[(bit >> 3) + 1]) << 8);
+    const std::size_t state = static_cast<std::size_t>((raw >> (bit & 7)) & 0x1ff);
+    const float entry       = key ? kTcq3HostCodebookK[state] : kTcq3HostCodebookV[state];
+    return bf16_to_f32(f32_to_bf16(f16_bits_to_f32(f32_to_f16_bits(entry)) * norm));
+}
+
+// TCQ3 rotates both K and V, unlike INT8 and FP8 which rotate the key only. The oracle
+// therefore needs an inverse-rotated decode of both planes.
+void encode_tcq3_row(std::span<const float> source, std::size_t source_base, bool key,
+                     std::vector<std::uint8_t>& codes, std::size_t code_base,
+                     std::vector<std::uint16_t>& norms, std::size_t norm_base,
+                     std::vector<float>& logical, std::size_t logical_base) {
+    std::array<float, kHeadDim> rotated{};
+    for (std::int32_t d = 0; d < kHeadDim; ++d) {
+        rotated[static_cast<std::size_t>(d)] = source[source_base + static_cast<std::size_t>(d)];
+    }
+    tcq3_rotate(rotated);
+
+    const float alpha = key ? kTcq3HostDecodeAlphaK : kTcq3HostDecodeAlphaV;
+    std::array<float, kHeadDim> decoded{};
+    for (std::int32_t group = 0; group < kTcq3Groups; ++group) {
+        const std::int32_t d0    = group * kTcq3Group;
+        std::uint8_t* stream     = codes.data() + code_base +
+                               static_cast<std::size_t>(group * kTcq3StreamBytes);
+        std::uint16_t* norm_bits = norms.data() + norm_base + static_cast<std::size_t>(group);
+        encode_tcq3_group(rotated.data() + d0, key, stream, norm_bits);
+        const float norm = f16_bits_to_f32(*norm_bits) * alpha;
+        for (std::int32_t t = 0; t < kTcq3Group; ++t) {
+            decoded[static_cast<std::size_t>(d0 + t)] = decode_tcq3_value(stream, t, norm, key);
+        }
+    }
+    tcq3_unrotate(decoded);
+    for (std::int32_t d = 0; d < kHeadDim; ++d) {
+        logical[logical_base + static_cast<std::size_t>(d)] = decoded[static_cast<std::size_t>(d)];
+    }
 }
 
 void encode_fp8_row(const std::array<float, kHeadDim>& values, std::vector<std::uint8_t>& codes,
@@ -514,6 +720,31 @@ HostCache make_cache(const Geometry& geometry, DType dtype, std::int32_t max_con
         return cache;
     }
 
+    if (dtype == DType::U8) {
+        const std::size_t norms = tcq3_norm_elements(geometry, logical_capacity);
+        cache.k_tcq3.assign(tcq3_code_elements(geometry, logical_capacity), 0);
+        cache.v_tcq3.assign(tcq3_code_elements(geometry, logical_capacity), 0);
+        cache.k_scale.assign(norms, 0);
+        cache.v_scale.assign(norms, 0);
+        cache.logical_k_quantized.assign(elements, 0.0f);
+        cache.logical_v_quantized.assign(elements, 0.0f);
+        for (std::int32_t head = 0; head < geometry.kv_heads; ++head) {
+            for (std::int32_t position = 0; position < logical_capacity; ++position) {
+                const std::size_t value =
+                    cache_index(geometry, logical_capacity, head, position, 0);
+                const std::size_t code =
+                    tcq3_code_index(geometry, logical_capacity, head, position, 0);
+                const std::size_t norm =
+                    tcq3_norm_index(geometry, logical_capacity, head, position, 0);
+                encode_tcq3_row(logical_k, value, true, cache.k_tcq3, code, cache.k_scale, norm,
+                                cache.logical_k_quantized, value);
+                encode_tcq3_row(logical_v, value, false, cache.v_tcq3, code, cache.v_scale, norm,
+                                cache.logical_v_quantized, value);
+            }
+        }
+        return cache;
+    }
+
     const std::size_t scales = dtype == DType::I8 ? scale_elements(geometry, logical_capacity)
                                                   : fp8_scale_elements(geometry, logical_capacity);
     cache.k_scale.assign(scales, 0);
@@ -582,6 +813,17 @@ void append_cache(HostCache& cache, const std::vector<float>& k, const std::vect
             const std::size_t source = kv_input_index(geometry, head, 0, token);
             const std::size_t target =
                 cache_index(geometry, cache.logical_capacity, head, position, 0);
+            if (cache.dtype == DType::U8) {
+                const std::size_t code =
+                    tcq3_code_index(geometry, cache.logical_capacity, head, position, 0);
+                const std::size_t norm =
+                    tcq3_norm_index(geometry, cache.logical_capacity, head, position, 0);
+                encode_tcq3_row(k, source, true, cache.k_tcq3, code, cache.k_scale, norm,
+                                cache.logical_k_quantized, target);
+                encode_tcq3_row(v, source, false, cache.v_tcq3, code, cache.v_scale, norm,
+                                cache.logical_v_quantized, target);
+                continue;
+            }
             if (cache.dtype == DType::FP8_E4M3FN) {
                 const std::size_t scale =
                     fp8_scale_index(geometry, cache.logical_capacity, head, position);
@@ -617,6 +859,11 @@ double cache_value(const HostCache& cache, bool key, std::int32_t head, std::int
     const std::size_t code = cache_index(cache.geometry, cache.logical_capacity, head, position, d);
     if (cache.dtype == DType::BF16) {
         return static_cast<double>(bf16_to_f32(key ? cache.k_bf16[code] : cache.v_bf16[code]));
+    }
+
+    if (cache.dtype == DType::U8) {
+        return static_cast<double>(key ? cache.logical_k_quantized[code]
+                                       : cache.logical_v_quantized[code]);
     }
 
     if (key) { return static_cast<double>(cache.logical_k_quantized[code]); }
@@ -673,10 +920,12 @@ public:
           logical_pages_(logical_capacity_ / kPagedKVPageSize),
           physical_pages_(physical_page_count(logical_pages_, mapping)),
           block_table_host_(make_block_table(logical_pages_, mapping)),
+          code_extent_(dtype_ == DType::U8 ? kTcq3RowBytes : kHeadDim),
           scale_groups_(dtype_ == DType::I8           ? kQuantGroups
                         : dtype_ == DType::FP8_E4M3FN ? kFp8QuantGroups
+                        : dtype_ == DType::U8         ? kTcq3Groups
                                                       : 0),
-          code_elements_(static_cast<std::size_t>(kHeadDim) * kPagedKVPageSize *
+          code_elements_(static_cast<std::size_t>(code_extent_) * kPagedKVPageSize *
                          geometry_.kv_heads * physical_pages_),
           scale_elements_(static_cast<std::size_t>(scale_groups_) * kPagedKVPageSize *
                           geometry_.kv_heads * physical_pages_),
@@ -715,6 +964,23 @@ public:
             v_.copy_from_host(v_physical.data(), v_physical.size() * sizeof(std::int8_t));
             k_scale_.copy_from_host(ks_physical.data(), ks_physical.size() * sizeof(std::uint16_t));
             v_scale_.copy_from_host(vs_physical.data(), vs_physical.size() * sizeof(std::uint16_t));
+        } else if (dtype_ == DType::U8) {
+            const auto k_physical =
+                scatter_paged(cache.k_tcq3, kTcq3RowBytes, geometry_, logical_capacity_,
+                              block_table_host_, physical_pages_);
+            const auto v_physical =
+                scatter_paged(cache.v_tcq3, kTcq3RowBytes, geometry_, logical_capacity_,
+                              block_table_host_, physical_pages_);
+            const auto ks_physical =
+                scatter_paged(cache.k_scale, kTcq3Groups, geometry_, logical_capacity_,
+                              block_table_host_, physical_pages_);
+            const auto vs_physical =
+                scatter_paged(cache.v_scale, kTcq3Groups, geometry_, logical_capacity_,
+                              block_table_host_, physical_pages_);
+            k_.copy_from_host(k_physical.data(), k_physical.size());
+            v_.copy_from_host(v_physical.data(), v_physical.size());
+            k_scale_.copy_from_host(ks_physical.data(), ks_physical.size() * sizeof(std::uint16_t));
+            v_scale_.copy_from_host(vs_physical.data(), vs_physical.size() * sizeof(std::uint16_t));
         } else {
             const auto k_physical =
                 scatter_paged(cache.k_fp8, kHeadDim, geometry_, logical_capacity_,
@@ -738,9 +1004,9 @@ public:
     PagedKVLayerView view() {
         PagedKVLayerView result;
         result.k_pages      = Tensor(k_.data(), dtype_,
-                                     {kHeadDim, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
+                                     {code_extent_, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
         result.v_pages      = Tensor(v_.data(), dtype_,
-                                     {kHeadDim, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
+                                     {code_extent_, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
         result.block_table  = Tensor(block_table_.data(), DType::I32, {logical_pages_});
         result.num_kv_heads = geometry_.kv_heads;
         result.head_dim     = kHeadDim;
@@ -752,7 +1018,9 @@ public:
             result.v_scale_pages =
                 Tensor(v_scale_.data(), DType::FP16,
                        {scale_groups_, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
-            result.quant_group = dtype_ == DType::I8 ? kQuantGroup : kFp8QuantGroup;
+            result.quant_group = dtype_ == DType::I8   ? kQuantGroup
+                                 : dtype_ == DType::U8 ? kTcq3Group
+                                                       : kFp8QuantGroup;
         }
         return result;
     }
@@ -793,6 +1061,19 @@ public:
             cache.k_scale = gather_paged<std::uint16_t>(ks_physical, kQuantGroups, geometry_,
                                                         logical_capacity_, block_table_host_);
             cache.v_scale = gather_paged<std::uint16_t>(vs_physical, kQuantGroups, geometry_,
+                                                        logical_capacity_, block_table_host_);
+        } else if (dtype_ == DType::U8) {
+            const auto k_physical  = copy_from_guarded<std::uint8_t>(k_, code_elements_);
+            const auto v_physical  = copy_from_guarded<std::uint8_t>(v_, code_elements_);
+            const auto ks_physical = copy_from_guarded<std::uint16_t>(k_scale_, scale_elements_);
+            const auto vs_physical = copy_from_guarded<std::uint16_t>(v_scale_, scale_elements_);
+            cache.k_tcq3           = gather_paged<std::uint8_t>(k_physical, kTcq3RowBytes, geometry_,
+                                                                logical_capacity_, block_table_host_);
+            cache.v_tcq3           = gather_paged<std::uint8_t>(v_physical, kTcq3RowBytes, geometry_,
+                                                                logical_capacity_, block_table_host_);
+            cache.k_scale = gather_paged<std::uint16_t>(ks_physical, kTcq3Groups, geometry_,
+                                                        logical_capacity_, block_table_host_);
+            cache.v_scale = gather_paged<std::uint16_t>(vs_physical, kTcq3Groups, geometry_,
                                                         logical_capacity_, block_table_host_);
         } else {
             const auto k_physical  = copy_from_guarded<std::uint8_t>(k_, code_elements_);
@@ -835,6 +1116,7 @@ private:
     std::int32_t logical_pages_;
     std::int32_t physical_pages_;
     std::vector<std::int32_t> block_table_host_;
+    std::int32_t code_extent_;
     std::int32_t scale_groups_;
     std::size_t code_elements_;
     std::size_t scale_elements_;
@@ -1081,6 +1363,14 @@ int verify_cache(const std::string& label, const HostCache& got, const HostCache
         }
         failures += verify_exact((label + " cache-v-code").c_str(), got.v_i8, expected.v_i8);
         failures += verify_exact((label + " cache-v-scale").c_str(), got.v_scale, expected.v_scale);
+    } else if (expected.dtype == DType::U8) {
+        if (verify_private_key_representation) {
+            failures += verify_exact((label + " cache-k-code").c_str(), got.k_tcq3, expected.k_tcq3);
+            failures +=
+                verify_exact((label + " cache-k-norm").c_str(), got.k_scale, expected.k_scale);
+        }
+        failures += verify_exact((label + " cache-v-code").c_str(), got.v_tcq3, expected.v_tcq3);
+        failures += verify_exact((label + " cache-v-norm").c_str(), got.v_scale, expected.v_scale);
     } else {
         if (verify_private_key_representation) {
             failures += verify_exact((label + " cache-k-code").c_str(), got.k_fp8, expected.k_fp8);
@@ -1112,12 +1402,14 @@ int verify_positions(const std::string& label, const GuardedDeviceBuffer& device
 const char* cache_name(DType dtype) {
     if (dtype == DType::BF16) return "bf16";
     if (dtype == DType::I8) return "int8-g64";
+    if (dtype == DType::U8) return "tcq3-g128";
     return "fp8-e4m3fn-row256";
 }
 
 ReductionCriterion attention_criterion(DType dtype) {
     if (dtype == DType::BF16) return kAttentionBf16Criterion;
     if (dtype == DType::I8) return kAttentionInt8Criterion;
+    if (dtype == DType::U8) return kAttentionTcq3Criterion;
     return kAttentionFp8Criterion;
 }
 
@@ -1567,6 +1859,27 @@ int run_fp8_cases() {
     return failures;
 }
 
+// TCQ3 contexts stay small because the fixture runs a 128-step Viterbi search for every
+// cached position, and that cost is what bounds the case list, not the kernels.
+int run_tcq3_cases() {
+    int failures = 0;
+    for (const Geometry& geometry : kGeometries) {
+        for (const MappingPattern mapping :
+             {MappingPattern::Identity, MappingPattern::Offset, MappingPattern::Fragmented}) {
+            // T of at most 6 routes to the small-T kernel, 7 or more to the prompt kernel.
+            failures += run_a3_case(geometry, DType::U8, {1, 61, 67, 701u}, mapping);
+            failures += run_a3_case(geometry, DType::U8, {6, 61, 67, 702u}, mapping);
+            failures += run_a3_case(geometry, DType::U8, {7, 17, 48, 703u}, mapping);
+            failures += run_a3_case(geometry, DType::U8, {17, 31, 48, 704u}, mapping);
+        }
+        failures += run_a3_case(geometry, DType::U8, {66, 63, 129, 705u}, MappingPattern::Identity);
+        // A1 appends through the device Viterbi encoder first, then attends over the result.
+        failures += run_a1_case(geometry, DType::U8, {6, 61, 67, 706u}, MappingPattern::Fragmented);
+        failures += run_a1_case(geometry, DType::U8, {17, 31, 48, 707u}, MappingPattern::Offset);
+    }
+    return failures;
+}
+
 int verify_workspace_capacity_contract() {
     int failures = 0;
     for (const DType dtype : {DType::BF16, DType::I8, DType::FP8_E4M3FN}) {
@@ -1614,6 +1927,7 @@ int run_softmax_attention_causal_cache_tests() {
     for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry); }
     failures += run_case_allowing_arch_skip("causal_softmax_attention FP8 KV cache",
                                             [&] { return run_fp8_cases(); });
+    failures += run_tcq3_cases();
     failures += run_batch_cases();
     std::cout << (failures == 0 ? "PASS" : "FAIL")
               << " causal_softmax_attention public-contract correctness\n";

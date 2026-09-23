@@ -6,9 +6,11 @@
 #include "ops/kv_cache/append/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_bf16.cuh"
 #include "ops/softmax_attention/dense/causal_cache/prompt_i8.cuh"
+#include "ops/softmax_attention/dense/causal_cache/prompt_tcq3.cuh"
 #include "core/device.h" // CUDA_CHECK
 
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -31,6 +33,26 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
     CUDA_CHECK(attr_i8);
 
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
+    if (cache.dtype == DType::U8) {
+        static const cudaError_t attr_tcq3 =
+            cudaFuncSetAttribute(causal_attention_prompt_tcq3_kernel<Geometry, Metadata>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 kCausalPromptSmemBytes);
+        CUDA_CHECK(attr_tcq3);
+        const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kCausalPromptBr)),
+                                  static_cast<unsigned>(Geometry::QHeads), 1u);
+        causal_attention_prompt_tcq3_kernel<Geometry, Metadata>
+            <<<attention_grid, kCausalPromptThreads, kCausalPromptSmemBytes, stream>>>(
+                static_cast<const __nv_bfloat16*>(q.data),
+                static_cast<const std::uint8_t*>(cache_k.data),
+                static_cast<const std::uint8_t*>(cache_v.data),
+                static_cast<const __half*>(cache.k_scale_pages.data),
+                static_cast<const __half*>(cache.v_scale_pages.data), metadata,
+                static_cast<const std::int32_t*>(positions.data), scale,
+                static_cast<__nv_bfloat16*>(out.data), tokens);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if (cache.dtype == DType::I8) {
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kCausalPromptI8Br)),
                                   static_cast<unsigned>(Geometry::QHeads), 1u);

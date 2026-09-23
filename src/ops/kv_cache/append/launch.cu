@@ -3,6 +3,7 @@
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/kv_cache/append/kernel.cuh"
+#include "ops/kv_cache/append/tcq3_encode.cuh"
 
 #include <cstdint>
 #include <stdexcept>
@@ -18,6 +19,25 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
     const auto tokens = static_cast<std::int32_t>(k.ne[2]);
     Tensor& cache_k   = cache.k_pages;
     Tensor& cache_v   = cache.v_pages;
+    if (cache.dtype == DType::U8) {
+        // One block for each group, because the Viterbi search is block-wide. Note the
+        // unguarded BF16 fallback at the end of this function: it would write 512 bytes
+        // into a 98-byte row, so the TCQ branch must return rather than fall through.
+        const int groups = tokens * Geometry::KVHeads * kKVCacheTcq3Groups;
+        if (groups > 0) {
+            kv_cache_append_full_tcq3_kernel<Geometry, Metadata>
+                <<<groups, kTcq3EncodeThreads, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(k.data),
+                    static_cast<const __nv_bfloat16*>(v.data),
+                    static_cast<const std::int32_t*>(positions.data), metadata,
+                    static_cast<std::uint8_t*>(cache_k.data),
+                    static_cast<std::uint8_t*>(cache_v.data),
+                    static_cast<__half*>(cache.k_scale_pages.data),
+                    static_cast<__half*>(cache.v_scale_pages.data), tokens);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        return;
+    }
     if (cache.dtype == DType::FP8_E4M3FN) {
         Tensor& cache_k_scale = cache.k_scale_pages;
         Tensor& cache_v_scale = cache.v_scale_pages;

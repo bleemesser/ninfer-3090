@@ -7,6 +7,11 @@
 namespace ninfer::targets::qwen3_6 {
 namespace {
 
+// Profiles that keep a separate FP16 scale plane next to the code plane.
+bool kv_profile_has_scale_planes(DType dtype) {
+    return dtype == DType::I8 || dtype == DType::FP8_E4M3FN || dtype == DType::U8;
+}
+
 std::uint32_t page_count(std::uint32_t capacity) {
     if (capacity == 0) { throw std::invalid_argument("Paged KV capacity must be positive"); }
     return 1U + (capacity - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
@@ -21,12 +26,17 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
         kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
         throw std::invalid_argument("Paged KV cache geometry is invalid");
     }
-    const bool scaled = dtype == DType::I8 || dtype == DType::FP8_E4M3FN;
+    // TCQ stores a packed bitstream rather than one code for each value, so its code
+    // plane is narrower than the head dimension. Every other profile stores one code
+    // for each value.
+    const bool tcq3 = dtype == DType::U8 && quant_group == kKvTcq3QuantGroup;
+    const bool scaled = kv_profile_has_scale_planes(dtype);
     const bool valid_profile =
         (dtype == DType::BF16 && quant_group == 0) ||
         (dtype == DType::I8 && quant_group == kKvInt8QuantGroup && head_dim % quant_group == 0) ||
         (dtype == DType::FP8_E4M3FN && head_dim == kKvFp8QuantGroup &&
-         quant_group == kKvFp8QuantGroup);
+         quant_group == kKvFp8QuantGroup) ||
+        (tcq3 && head_dim % quant_group == 0);
     if (!valid_profile) {
         throw std::invalid_argument("Paged KV cache dtype or quantization is invalid");
     }
@@ -38,9 +48,11 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
 
     KVPageGeometry geometry;
     geometry.planes.reserve(static_cast<std::size_t>(layers) * (scaled ? 4ULL : 2ULL));
+    const std::int32_t code_extent =
+        tcq3 ? (head_dim / quant_group) * kKvTcq3StreamBytes : head_dim;
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
-        geometry.planes.push_back({dtype, head_dim, kv_heads, 256});
-        geometry.planes.push_back({dtype, head_dim, kv_heads, 256});
+        geometry.planes.push_back({dtype, code_extent, kv_heads, 256});
+        geometry.planes.push_back({dtype, code_extent, kv_heads, 256});
         if (scaled) {
             geometry.planes.push_back({DType::FP16, head_dim / quant_group, kv_heads, 256});
             geometry.planes.push_back({DType::FP16, head_dim / quant_group, kv_heads, 256});
@@ -103,7 +115,7 @@ PagedKVCacheView PagedKVCache::execution_view(const KVExecutionRowLease& row) co
 
 PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_table) const {
     if (layer >= layers_) { throw std::out_of_range("Paged KV layer is out of range"); }
-    const bool scaled        = dtype_ == DType::I8 || dtype_ == DType::FP8_E4M3FN;
+    const bool scaled        = kv_profile_has_scale_planes(dtype_);
     const std::size_t stride = scaled ? 4ULL : 2ULL;
     const std::size_t base   = static_cast<std::size_t>(layer) * stride;
     return PagedKVLayerView{
@@ -121,7 +133,7 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_tabl
 
 PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const {
     if (layer >= layers_) { throw std::out_of_range("Paged KV layer is out of range"); }
-    const bool scaled        = dtype_ == DType::I8 || dtype_ == DType::FP8_E4M3FN;
+    const bool scaled        = kv_profile_has_scale_planes(dtype_);
     const std::size_t stride = scaled ? 4ULL : 2ULL;
     const std::size_t base   = static_cast<std::size_t>(layer) * stride;
     return PagedKVBatchLayerView{

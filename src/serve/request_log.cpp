@@ -137,6 +137,8 @@ const char* kv_cache_name(ninfer::KvCacheStorage storage) {
         return "int8-group64";
     case ninfer::KvCacheStorage::Fp8E4M3Row256:
         return "fp8-e4m3-row256";
+    case ninfer::KvCacheStorage::Tcq3Group128:
+        return "tcq3-group128";
     case ninfer::KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
         return "rotated-k8-v4-group64";
     }

@@ -4,7 +4,9 @@
 
 #include "ops/common/math.h"
 #include "ops/softmax_attention/dense/causal_cache/small_t.cuh"
+#include "ops/kv_cache/append/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/small_t_bf16.cuh"
+#include "ops/softmax_attention/dense/causal_cache/small_t_tcq3.cuh"
 #include "ops/softmax_attention/dense/causal_cache/small_t_i8.cuh"
 #include "core/device.h" // CUDA_CHECK
 #include "ninfer/ops/softmax_attention.h"
@@ -106,6 +108,39 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
             static_cast<const __nv_bfloat16*>(q.data), input,
             static_cast<const std::int32_t*>(pos.data), static_cast<__nv_bfloat16*>(cache_k.data),
             static_cast<__nv_bfloat16*>(cache_v.data),
+            static_cast<const std::int32_t*>(cache.block_tables.data),
+            invocation.valid_columns == nullptr
+                ? nullptr
+                : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+            invocation.table_rows == nullptr
+                ? nullptr
+                : static_cast<const std::int32_t*>(invocation.table_rows->data),
+            cache.block_tables.ne[0], invocation.width, invocation.full_width,
+            invocation.column_begin, logical_capacity, scale,
+            static_cast<__nv_bfloat16*>(partial_acc.data), static_cast<float*>(partial_m.data),
+            static_cast<float*>(partial_l.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
+          typename CacheInput>
+void launch_tc_partial_tcq3(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
+                            PagedKVBatchLayerView cache, const CausalSmallTInvocation& invocation,
+                            std::int32_t logical_capacity, std::int32_t splits, Tensor& partial_acc,
+                            Tensor& partial_m, Tensor& partial_l, cudaStream_t stream) {
+    constexpr int kBlock = 32 * WarpsPerCta;
+    const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
+    // Same static-only shared memory as the BF16 kernel: the decoded tile is the staging
+    // buffer, so TCQ needs no dynamic arena.
+    causal_attention_small_t_tc_partial_tcq3_kernel<Geometry, TokenTile, WarpsPerCta, MultiBatch,
+                                                    Masked, CacheInput>
+        <<<grid, kBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(q.data), input,
+            static_cast<const std::int32_t*>(pos.data),
+            static_cast<const std::uint8_t*>(cache.k_pages.data),
+            static_cast<const std::uint8_t*>(cache.v_pages.data),
+            static_cast<const __half*>(cache.k_scale_pages.data),
+            static_cast<const __half*>(cache.v_scale_pages.data),
             static_cast<const std::int32_t*>(cache.block_tables.data),
             invocation.valid_columns == nullptr
                 ? nullptr
@@ -232,7 +267,7 @@ std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t 
                                              CausalAttentionExecutionEnvelope envelope) {
     if (tokens < 1 || tokens > 6 ||
         (cache_dtype != DType::BF16 && cache_dtype != DType::I8 &&
-         cache_dtype != DType::FP8_E4M3FN) ||
+         cache_dtype != DType::FP8_E4M3FN && cache_dtype != DType::U8) ||
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys) {
         throw std::invalid_argument("causal_softmax_attention split capacity: invalid profile");
     }
@@ -267,6 +302,15 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
                 launch_tc_partial_i8<Geometry, (TOKENS), MultiBatch, Masked>(                      \
                     q, input, pos, scale, cache, invocation, logical_capacity,                     \
                     implementation_window, splits, partial_acc, partial_m, partial_l, stream);     \
+            } else if (cache.dtype == DType::U8) {                                                 \
+                if constexpr (CacheInput::writes_cache) {                                          \
+                    throw std::invalid_argument(                                                   \
+                        "causal_softmax_attention: TCQ KV cannot fuse the append");                \
+                } else {                                                                           \
+                    launch_tc_partial_tcq3<Geometry, (TOKENS), (WARPS), MultiBatch, Masked>(       \
+                        q, input, pos, scale, cache, invocation, logical_capacity, splits,         \
+                        partial_acc, partial_m, partial_l, stream);                                \
+                }                                                                                  \
             } else {                                                                               \
                 launch_tc_partial_bf16<Geometry, (TOKENS), (WARPS), MultiBatch, Masked>(           \
                     q, input, pos, scale, cache, invocation, logical_capacity, splits,             \
@@ -369,8 +413,6 @@ void causal_attention_small_t_launch(
                                             partial_l, out, stream);
         return;
     }
-    const CausalAppendInput input{static_cast<const __nv_bfloat16*>(k.data),
-                                  static_cast<const __nv_bfloat16*>(v.data)};
     const CausalSmallTInvocation invocation{
         .valid_columns = valid_columns.data == nullptr ? nullptr : &valid_columns,
         .table_rows    = &table_rows,
@@ -379,6 +421,25 @@ void causal_attention_small_t_launch(
         .width         = width,
         .batch_size    = q.ne[3],
     };
+    if (cache.dtype == DType::U8) {
+        // TCQ encoding is a Viterbi search, which does not fit the per-warp fused append.
+        // Write the new rows through the append Op first, then read them back from the
+        // cache like any other key. The prompt path does the same.
+        kv_cache_append_batch_launch(k, v, pos, valid_columns, table_rows, cache, stream);
+        const CausalCachedInput cached{};
+        if (q.ne[1] == CausalD256H24Kv4::QHeads) {
+            causal_attention_small_t_launch_for<CausalD256H24Kv4>(
+                q, cached, pos, scale, cache, invocation, envelope, partial_acc, partial_m,
+                partial_l, out, stream);
+            return;
+        }
+        causal_attention_small_t_launch_for<CausalD256H16Kv2>(q, cached, pos, scale, cache,
+                                                              invocation, envelope, partial_acc,
+                                                              partial_m, partial_l, out, stream);
+        return;
+    }
+    const CausalAppendInput input{static_cast<const __nv_bfloat16*>(k.data),
+                                  static_cast<const __nv_bfloat16*>(v.data)};
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
         causal_attention_small_t_launch_for<CausalD256H24Kv4>(q, input, pos, scale, cache,
                                                               invocation, envelope, partial_acc,

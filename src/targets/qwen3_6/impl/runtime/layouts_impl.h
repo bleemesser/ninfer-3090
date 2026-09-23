@@ -82,6 +82,8 @@ TargetKVCacheProfile target_kv_cache_profile(KvCacheStorage storage) {
 #else
         return {DType::FP8_E4M3FN, qwen3_6::kKvFp8QuantGroup};
 #endif
+    case KvCacheStorage::Tcq3Group128:
+        return {DType::U8, qwen3_6::kKvTcq3QuantGroup};
     case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
         // RotorQuant rk8v4 quantized and rotated K/V inside the fused GQA attention kernels.
         // KV quantization is now owned by the kv_cache_append Op, which defines K rotation as
