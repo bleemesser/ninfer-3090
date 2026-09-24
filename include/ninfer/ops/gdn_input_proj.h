@@ -43,6 +43,17 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
                     Tensor& qkv, Tensor& z, cudaStream_t stream);
 
 /**
+ * Policy-bearing two-parent Q4/Q5 form. A16Only matches the convenience form. AllowA8 resolves
+ * T<=16 to the A16 routes and every T>=17 to private INT8 activation quantization, one scale for
+ * each 64-value group, followed by the A8 Tensor Core route, compared under the A8 criterion.
+ * Its transient storage is sized by gdn_input_proj_workspace_capacity_bytes() with the Q4 query/key
+ * parent profile `(Q4G64_F16S, 4096, 5120)`.
+ */
+void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                    Tensor& qkv, Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
+                    cudaStream_t stream);
+
+/**
  * Single-parent GDN projection. Registered parent forms are:
  *
  * - W8G32_F16S RowSplit [12288,2048], with stored row counts [2048,2048,4096,4096];
@@ -83,10 +94,11 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
  * snapshot profile. `batch_size` is exact and the query covers every W in the inclusive width
  * interval. B=1 preserves the format-specific fused/composed resolver. B=2..8 uses aggregate
  * projection plus one BF16 [C,B*W] projected plane. The query throws for an unregistered row
- * profile or unsupported B/W domain.
+ * profile or unsupported B/W domain. W8 admits A16Only; Q4/Q5 admits A16Only and AllowA8, which
+ * adds the two-parent projection's A8 activation storage to the B=1 materialized route.
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-    std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
+    std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows, LinearPolicy policy,
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
 
 /**
@@ -122,8 +134,9 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
  *   snapshots are promoted and compared directly with those ideal values; their final storage
  *   rounding belongs to the Op's named A16 criterion, not the oracle. Former unfused projection
  *   tensors are not observable cast boundaries; production routes use their natural private
- *   accumulator and staging precision. This two-parent Q4/Q5 form does not quantize activation;
- *   the single-parent policy-bearing form below defines its own permitted compute profiles.
+ *   accumulator and staging precision. The two-parent Q4/Q5 form quantizes activation only under
+ *   AllowA8 at B=1 and W>=17, through the policy-bearing two-parent gdn_input_proj, and is then
+ *   compared under the A8 criterion. The single-parent form below defines its own profiles.
  *
  * Effects:
  *   Each row writes query/key/value through its valid prefix and exact zero to its invalid tail;
@@ -138,7 +151,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
                                   Tensor& conv_states, const Tensor& valid_columns,
                                   const Tensor& initial_state_slots,
                                   const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
-                                  Tensor& value, Tensor& z, WorkspaceArena& ws,
+                                  Tensor& value, Tensor& z, LinearPolicy policy, WorkspaceArena& ws,
                                   cudaStream_t stream);
 
 /**

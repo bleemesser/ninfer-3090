@@ -52,7 +52,9 @@ namespace ninfer::ops {
  *   rounding boundaries.
  *
  * Compute policy:
- *   Q5, W8, and BF16_CTRL admit only A16Only. NVFP4 admits A16Only and AllowA4. Row-scaled FP8
+ *   W8 and BF16_CTRL admit only A16Only. Q5 admits A16Only and AllowA8; AllowA8 resolves T<=16
+ *   to A16 and every T>=17 to INT8 activations with one scale for each 64-value group, rounded
+ *   into the residual once. NVFP4 admits A16Only and AllowA4. Row-scaled FP8
  *   admits A16Only and AllowA8. Its two semantic registrations own independent production plans:
  *   [5120,6144] resolves T<22 to A16 and T>=22 to A8, while [5120,17408] resolves T<25 to A16 and
  *   T>=25 to A8. A permissive policy allows the private resolver to select either qualified

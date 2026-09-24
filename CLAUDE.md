@@ -117,11 +117,21 @@ memory without crashing, and the model still emits semi-coherent text, so it rea
 quality rather than a bug. Both the append path and the prompt path had this. When adding a KV
 profile, check every dispatch, not just the one the failing case exercises.
 
-Codebook lookups diverge across a warp. In `__constant__` memory that serializes up to 32 ways, and
-it was the single largest cost in both attention kernels. The shared copy in the prompt kernel is
-FP16 rather than FP32, because the dynamic arena is already full at 96 KiB and an FP32 copy misses
-the 99 KiB opt-in limit by 1 KiB. The FP16 copy costs 0.086 percent perplexity.
+Codebook lookups diverge across a warp. In `__constant__` memory that serializes up to 32 ways, so
+every kernel that decodes copies both FP32 codebooks into shared memory first. The prompt kernel
+has room for FP32 because it decodes 32-key tiles and keeps the compressed tiles, not decoded
+ones, in its three-stage prefetch ring.
 
-Prefill is bandwidth bound, not math bound. The barrier structure already lets both decodes overlap
-the matmuls. With the decode stubbed out, the whole remaining decode is worth 1.9 percent at 4060
-prompt tokens and 10.2 percent at 16060. Retiling for more overlap has little left to win.
+Global loads inside a staging loop do not batch. The small-T kernel once copied each tile byte by
+byte and paid about 25 serial memory latencies per tile. Stage compressed tiles with 16-byte
+cp.async and prefetch the next tile while the current one runs through the MMAs.
+
+## Prefill and decode projections
+
+Q4/Q5 text projections run under `LinearPolicy::AllowA8` for this target. From T=17 the prefill
+routes quantize activations to INT8 with one scale for each 64-value group and use m16n8k32 INT8
+MMA, which has four times the BF16 FP32-accumulate rate on sm_86. The mechanism is
+`src/ops/common/groupwise_a8.{h,cu}`. For T=2..8, the MTP verify width, the projections use the
+streaming kernel in `src/ops/common/groupwise_small_t.{h,cu}`, which keeps weight codes exact.
+Perplexity on wikitext 00.txt at context 2048 and stride 1024 is 6.404815 with both, against
+6.419089 for the earlier A16 path.

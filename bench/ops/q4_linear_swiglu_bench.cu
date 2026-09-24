@@ -32,6 +32,7 @@ struct Options {
     int warmup   = 5;
     int repeat   = 30;
     bool profile = false;
+    ops::LinearPolicy policy = ops::LinearPolicy::A16Only;
 };
 
 std::vector<std::int32_t> parse_tokens(std::string_view raw) {
@@ -69,9 +70,12 @@ Options parse_options(int argc, char** argv) {
             options.repeat = std::stoi(std::string(next("--repeat value")));
         } else if (argument == "--profile") {
             options.profile = true;
+        } else if (argument == "--a8") {
+            options.policy = ops::LinearPolicy::AllowA8;
         } else if (argument == "--help" || argument == "-h") {
-            std::printf("Usage: %s [--t-sweep 1,2,...] [--warmup N] [--repeat N] [--profile]\n",
-                        argv[0]);
+            std::printf(
+                "Usage: %s [--t-sweep 1,2,...] [--warmup N] [--repeat N] [--profile] [--a8]\n",
+                argv[0]);
             std::exit(0);
         } else {
             throw std::invalid_argument("unknown argument: " + std::string(argument));
@@ -104,13 +108,13 @@ int main(int argc, char** argv) {
         bench::PackedQuantizedWeight packed = bench::make_row_split_weight(
             QType::Q4G64_F16S, kGateUpRows, kHidden, kHidden, {0x31, 0xa5, 0x3c00});
         const std::size_t workspace_capacity = ops::linear_swiglu_workspace_capacity_bytes(
-            QType::Q4G64_F16S, kGateUpRows, kHidden, min_t, max_t);
+            QType::Q4G64_F16S, kGateUpRows, kHidden, options.policy, min_t, max_t);
         WorkspaceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
 
         const auto launch = [&](std::int32_t tokens, cudaStream_t launch_stream) {
             Tensor x(input.p, DType::BF16, {kHidden, tokens});
             Tensor out(output.p, DType::BF16, {kOutputRows, tokens});
-            ops::linear_swiglu(x, packed.weight, out, workspace, launch_stream);
+            ops::linear_swiglu(x, packed.weight, out, options.policy, workspace, launch_stream);
         };
 
         if (options.profile) {

@@ -20,9 +20,9 @@ decoding, and vision. That combination needs about 22.3 GiB, which leaves
 1.8 GiB free on a 24 GiB card, so close other GPU users first.
 
 tcq3 is the trellis-coded 3.25-bit KV cache ported from the llama.cpp
-TurboQuant fork, and it is what makes 262144 context fit. int8 is faster at
-prefill on long prompts but runs out of memory well before full context; pass
--- --kv-dtype int8 with a smaller CTX to try it.
+TurboQuant fork, and it is what makes 262144 context fit. int8 prefills about
+2 percent faster at 16384 tokens but runs out of memory well before full
+context; pass -- --kv-dtype int8 with a smaller CTX to try it.
 
 Binding: ninfer-serve takes one --host, so it binds the Tailscale IP. With
 LOOPBACK=on a socat forwarder adds 127.0.0.1 on the same port. Do not use

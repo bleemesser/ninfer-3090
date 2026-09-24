@@ -238,7 +238,7 @@ int run_q4_q5() {
                          std::uint32_t seed) {
         const std::size_t snapshot_bytes =
             ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-                kQueryRows, kKeyRows, kValueRows, batch, width, width);
+                kQueryRows, kKeyRows, kValueRows, ops::LinearPolicy::A16Only, batch, width, width);
         const std::size_t record_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
             kQueryRows, kKeyRows, kValueRows, batch, width, width);
         return run_case(
@@ -248,7 +248,7 @@ int run_q4_q5() {
                 const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
                 Tensor& z, WorkspaceArena& workspace) {
                 ops::gdn_input_proj_conv_snapshot(x, qk.view(), value_z.view(), conv, state,
-                                                  valid_columns, initial, snapshot_base, q, k, v, z,
+                                                  valid_columns, initial, snapshot_base, q, k, v, z, ops::LinearPolicy::A16Only,
                                                   workspace, nullptr);
             },
             [&](const Tensor& x, const Tensor& conv, const Tensor& state,
@@ -282,7 +282,7 @@ int run_w8() {
                          std::uint32_t seed) {
         const std::size_t snapshot_bytes =
             ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-                kQueryRows, kKeyRows, kValueRows, batch, width, width);
+                kQueryRows, kKeyRows, kValueRows, ops::LinearPolicy::A16Only, batch, width, width);
         const std::size_t record_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
             kQueryRows, kKeyRows, kValueRows, batch, width, width);
         return run_case(

@@ -115,6 +115,9 @@ add_library(ninfer_ops STATIC
   ops/linear_attention/gated_delta_net/chunked/prepare_wy_wu.cu
   ops/linear_attention/gated_delta_net/chunked/state_passing.cu
   ops/linear_attention/gated_delta_net/chunked/output.cu
+  ops/common/groupwise_a8.cu
+  ops/common/groupwise_job.cpp
+  ops/common/groupwise_small_t.cu
   ops/attn_input_proj/bf16/bf16_attn_input_decode.cu
   ops/attn_input_proj/bf16/bf16_attn_input_gemm_mma.cu
   ops/attn_input_proj/bf16/bf16_attn_input_small_t.cu

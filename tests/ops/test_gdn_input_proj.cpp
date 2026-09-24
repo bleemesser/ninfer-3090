@@ -27,16 +27,18 @@ int verify_output_range(std::string_view label, const GuardedBf16Tensor& output,
                         std::int32_t full_rows, std::int32_t output_row_offset,
                         std::int32_t output_rows, const quantized_weight::PackedWeight& weight,
                         std::int32_t weight_row_offset, const std::vector<float>& activation,
-                        std::int32_t hidden, std::int32_t tokens) {
+                        std::int32_t hidden, std::int32_t tokens, bool a8 = false) {
+    const std::int32_t samples = a8 ? kA8SampleRows : 7;
     const std::vector<double> actual =
-        gather_rows(output.values(), full_rows, output_row_offset, output_rows, tokens);
-    const std::vector<double> expected =
-        projection_oracle(weight, weight_row_offset, output_rows, activation, hidden, tokens);
-    return compare(label, actual, expected, kGdnInputProjA16Tolerance);
+        gather_rows(output.values(), full_rows, output_row_offset, output_rows, tokens, samples);
+    const std::vector<double> expected = projection_oracle(weight, weight_row_offset, output_rows,
+                                                           activation, hidden, tokens, samples);
+    return compare(label, actual, expected,
+                   a8 ? kFp8GdnInputProjA8Tolerance : kGdnInputProjA16Tolerance);
 }
 
 int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_weight,
-                   std::int32_t tokens) {
+                   std::int32_t tokens, ops::LinearPolicy policy) {
     constexpr std::int32_t kHidden      = 5120;
     constexpr std::int32_t kQkRows      = 4096;
     constexpr std::int32_t kValueRows   = 6144;
@@ -50,20 +52,35 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
     Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
     Tensor output   = qkv.tensor();
     Tensor z_output = z.tensor();
-    ops::gdn_input_proj(x, query_key.view(), value_z_weight.view(), output, z_output, nullptr);
+    const bool a8 = policy == ops::LinearPolicy::AllowA8 && tokens >= 17;
+    int failures  = 0;
+    if (policy == ops::LinearPolicy::A16Only) {
+        ops::gdn_input_proj(x, query_key.view(), value_z_weight.view(), output, z_output, nullptr);
+    } else {
+        const std::size_t capacity = ops::gdn_input_proj_workspace_capacity_bytes(
+            QType::Q4G64_F16S, kQkRows, kHidden, policy, tokens, tokens);
+        WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
+        ops::gdn_input_proj(x, query_key.view(), value_z_weight.view(), output, z_output, policy,
+                            workspace, nullptr);
+        if (workspace.used() != 0 || workspace.peak_used() != capacity || (a8 != (capacity != 0))) {
+            std::cerr << "gdn Q4/Q5 T=" << tokens << ": workspace query/execution mismatch\n";
+            ++failures;
+        }
+    }
     cuda_synchronize();
 
-    const std::string suffix = " Q4/Q5 A16 T=" + std::to_string(tokens);
-    int failures             = qkv.verify_guards("gdn qkv" + suffix);
+    const std::string suffix = std::string(" Q4/Q5 ") + (a8 ? "A8" : "A16") +
+                               " T=" + std::to_string(tokens);
+    failures += qkv.verify_guards("gdn qkv" + suffix);
     failures += z.verify_guards("gdn z" + suffix);
     failures += qkv.verify_fully_written("gdn qkv" + suffix);
     failures += z.verify_fully_written("gdn z" + suffix);
     failures += verify_output_range("gdn qk" + suffix, qkv, kRows, 0, kQkRows, query_key.host, 0,
-                                    activation, kHidden, tokens);
+                                    activation, kHidden, tokens, a8);
     failures += verify_output_range("gdn value" + suffix, qkv, kRows, kQkRows, kValueRows,
-                                    value_z_weight.host, 0, activation, kHidden, tokens);
+                                    value_z_weight.host, 0, activation, kHidden, tokens, a8);
     failures += verify_output_range("gdn z" + suffix, z, kZRows, 0, kZRows, value_z_weight.host,
-                                    kValueRows, activation, kHidden, tokens);
+                                    kValueRows, activation, kHidden, tokens, a8);
     failures += verify_preserved("gdn x" + suffix, device_activation, activation_bits);
     failures += query_key.verify_preserved("gdn query/key weight" + suffix);
     failures += value_z_weight.verify_preserved("gdn value/z weight" + suffix);
@@ -77,8 +94,11 @@ int run_q4_q5() {
     DevicePackedWeight value_z_weight(
         quantized_weight::make_patterned_weight(QType::Q5G64_F16S, 12288, kHidden, 419U));
     int failures = 0;
-    for (const std::int32_t tokens : {1, 2, 16, 17}) {
-        failures += run_q4_q5_case(query_key, value_z_weight, tokens);
+    for (const std::int32_t tokens : {1, 2, 4, 8, 9, 16, 17}) {
+        failures += run_q4_q5_case(query_key, value_z_weight, tokens, ops::LinearPolicy::A16Only);
+    }
+    for (const std::int32_t tokens : {16, 17, 64, 200, 1024}) {
+        failures += run_q4_q5_case(query_key, value_z_weight, tokens, ops::LinearPolicy::AllowA8);
     }
     return failures;
 }

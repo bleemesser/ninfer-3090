@@ -237,7 +237,7 @@ struct Resources {
                               ops::gdn_norm_gating_proj_workspace_capacity_bytes(
                                   kValueHeads, kHidden, 1, max_tokens),
                               ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-                                  kKeyRows, kKeyRows, kValueRows, 1, 1, max_tokens),
+                                  kKeyRows, kKeyRows, kValueRows, ops::LinearPolicy::A16Only, 1, 1, max_tokens),
                               ops::linear_add_workspace_capacity_bytes(
                                   QType::W8G32_F16S, kHidden, kValueRows, 1, max_tokens)})) {}
 

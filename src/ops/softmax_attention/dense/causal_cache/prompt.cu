@@ -37,12 +37,12 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
         static const cudaError_t attr_tcq3 =
             cudaFuncSetAttribute(causal_attention_prompt_tcq3_kernel<Geometry, Metadata>,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 kCausalPromptSmemBytes);
+                                 kCausalPromptTcq3SmemBytes);
         CUDA_CHECK(attr_tcq3);
-        const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kCausalPromptBr)),
+        const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kCausalPromptTcq3Br)),
                                   static_cast<unsigned>(Geometry::QHeads), 1u);
         causal_attention_prompt_tcq3_kernel<Geometry, Metadata>
-            <<<attention_grid, kCausalPromptThreads, kCausalPromptSmemBytes, stream>>>(
+            <<<attention_grid, kCausalPromptTcq3Threads, kCausalPromptTcq3SmemBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data),
                 static_cast<const std::uint8_t*>(cache_k.data),
                 static_cast<const std::uint8_t*>(cache_v.data),

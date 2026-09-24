@@ -48,7 +48,7 @@ int verify_output(std::string_view label, const GuardedBf16Tensor& output,
 }
 
 int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& gate_value,
-                   std::int32_t tokens) {
+                   std::int32_t tokens, ops::LinearPolicy policy) {
     constexpr std::int32_t kHidden      = 5120;
     constexpr std::int32_t kQRows       = 6144;
     constexpr std::int32_t kKvRows      = 1024;
@@ -65,19 +65,35 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& gate_value
     Tensor g = gate.tensor();
     Tensor k = key.tensor();
     Tensor v = value.tensor();
-    ops::attn_input_proj(x, query_key.view(), gate_value.view(), q, g, k, v, nullptr);
+    const bool a8 = policy == ops::LinearPolicy::AllowA8 && tokens >= 17;
+    int failures  = 0;
+    if (policy == ops::LinearPolicy::A16Only) {
+        ops::attn_input_proj(x, query_key.view(), gate_value.view(), q, g, k, v, nullptr);
+    } else {
+        const std::size_t capacity = ops::attn_input_proj_workspace_capacity_bytes(
+            QType::Q4G64_F16S, kQRows + kKvRows, kHidden, policy, tokens, tokens);
+        WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
+        ops::attn_input_proj(x, query_key.view(), gate_value.view(), q, g, k, v, policy,
+                             workspace, nullptr);
+        if (workspace.used() != 0 || workspace.peak_used() != capacity || (a8 != (capacity != 0))) {
+            std::cerr << "attn Q4/Q5 T=" << tokens << ": workspace query/execution mismatch\n";
+            ++failures;
+        }
+    }
     cuda_synchronize();
 
-    const std::string suffix = " Q4/Q5 A16 T=" + std::to_string(tokens);
-    int failures             = 0;
+    const std::string suffix = std::string(" Q4/Q5 ") + (a8 ? "A8" : "A16") +
+                               " T=" + std::to_string(tokens);
+    const ReductionCriterion& criterion = a8 ? kAttnInputProjA8Tolerance : kAttnInputProjA16Tolerance;
+    const std::int32_t samples          = a8 ? kA8SampleRows : 7;
     failures += verify_output("attn q" + suffix, query, query_key.host, 0, kQRows, activation,
-                              kHidden, tokens);
+                              kHidden, tokens, criterion, samples);
     failures += verify_output("attn k" + suffix, key, query_key.host, kQRows, kKvRows, activation,
-                              kHidden, tokens);
+                              kHidden, tokens, criterion, samples);
     failures += verify_output("attn gate" + suffix, gate, gate_value.host, 0, kQRows, activation,
-                              kHidden, tokens);
+                              kHidden, tokens, criterion, samples);
     failures += verify_output("attn value" + suffix, value, gate_value.host, kQRows, kKvRows,
-                              activation, kHidden, tokens);
+                              activation, kHidden, tokens, criterion, samples);
     failures += verify_preserved("attn x" + suffix, device_activation, activation_bits);
     failures += query_key.verify_preserved("attn query/key" + suffix);
     failures += gate_value.verify_preserved("attn gate/value" + suffix);
@@ -93,8 +109,11 @@ int run_q4_q5() {
         quantized_weight::make_patterned_weight(QType::Q5G64_F16S, kParent, kHidden, 107U));
 
     int failures = 0;
-    for (const std::int32_t tokens : {1, 2, 16, 17, 21, 48}) {
-        failures += run_q4_q5_case(query_key, gate_value, tokens);
+    for (const std::int32_t tokens : {1, 2, 4, 8, 9, 16, 17, 21, 48}) {
+        failures += run_q4_q5_case(query_key, gate_value, tokens, ops::LinearPolicy::A16Only);
+    }
+    for (const std::int32_t tokens : {16, 17, 64, 200, 1024}) {
+        failures += run_q4_q5_case(query_key, gate_value, tokens, ops::LinearPolicy::AllowA8);
     }
     return failures;
 }

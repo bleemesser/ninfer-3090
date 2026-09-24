@@ -20,13 +20,13 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
     Tensor& cache_k   = cache.k_pages;
     Tensor& cache_v   = cache.v_pages;
     if (cache.dtype == DType::U8) {
-        // One block for each group, because the Viterbi search is block-wide. Note the
-        // unguarded BF16 fallback at the end of this function: it would write 512 bytes
-        // into a 98-byte row, so the TCQ branch must return rather than fall through.
-        const int groups = tokens * Geometry::KVHeads * kKVCacheTcq3Groups;
-        if (groups > 0) {
+        // One warp for each group of K or V. Note the unguarded BF16 fallback at the end of
+        // this function: it would write 512 bytes into a 98-byte row, so the TCQ branch must
+        // return rather than fall through.
+        const int units = tokens * Geometry::KVHeads * kKVCacheTcq3Groups * 2;
+        if (units > 0) {
             kv_cache_append_full_tcq3_kernel<Geometry, Metadata>
-                <<<groups, kTcq3EncodeThreads, 0, stream>>>(
+                <<<div_up(units, kTcq3EncodeWarps), kTcq3EncodeThreads, 0, stream>>>(
                     static_cast<const __nv_bfloat16*>(k.data),
                     static_cast<const __nv_bfloat16*>(v.data),
                     static_cast<const std::int32_t*>(positions.data), metadata,

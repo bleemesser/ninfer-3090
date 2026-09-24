@@ -414,7 +414,7 @@ public:
                 kQueryRows, kKeyRows, kValueRows, batch, tokens, tokens);
         }
         return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            kQueryRows, kKeyRows, kValueRows, batch, tokens, tokens);
+            kQueryRows, kKeyRows, kValueRows, ops::LinearPolicy::A16Only, batch, tokens, tokens);
     }
 
     void launch(Form form, const Tensor& x, Tensor& conv_states, const Tensor& initial,
@@ -429,7 +429,7 @@ public:
         } else {
             ops::gdn_input_proj_conv_snapshot(x, qk_.weight, value_z_.weight, convolution_weight,
                                               conv_states, valid_columns, initial, snapshot_base,
-                                              query, key, value, z, workspace, stream);
+                                              query, key, value, z, ops::LinearPolicy::A16Only, workspace, stream);
         }
     }
 
@@ -588,7 +588,7 @@ public:
             return ops::gdn_input_proj_conv_record_workspace_capacity_bytes(2048, 2048, 4096, batch,
                                                                             tokens, tokens);
         }
-        return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, batch,
+        return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, ops::LinearPolicy::A16Only, batch,
                                                                           tokens, tokens);
     }
 

@@ -717,15 +717,22 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
 
 } // namespace
 
-void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
-                    Tensor& qkv, Tensor& z, cudaStream_t stream) {
+namespace {
+
+void dispatch_two_parent(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                         Tensor& qkv, Tensor& z, LinearPolicy policy, WorkspaceArena* workspace,
+                         cudaStream_t stream) {
     constexpr std::int32_t kHidden     = 5120;
     constexpr std::int32_t kQkRows     = 4096;
     constexpr std::int32_t kValueRows  = 6144;
     constexpr std::int32_t kZRows      = 6144;
     constexpr std::int32_t kQkvRows    = kQkRows + kValueRows;
     constexpr std::int32_t kParentRows = kValueRows + kZRows;
-    const std::int32_t cols            = x.ne[1];
+    validate_policy(policy);
+    if (policy == LinearPolicy::AllowA4) {
+        throw std::invalid_argument("Q4/Q5 gdn_input_proj admits A16Only and AllowA8");
+    }
+    const std::int32_t cols = x.ne[1];
     if (cols <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
     require_matrix(x, kHidden, cols, "x");
     require_matrix(qkv, kQkvRows, cols, "qkv");
@@ -733,7 +740,22 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
     require_rowsplit(qk_weight, QType::Q4G64_F16S, kQkRows, "qk weight");
     require_rowsplit(value_z_weight, QType::Q5G64_F16S, kParentRows, "value/z weight");
 
-    detail::q4_q5_gdn_input_dispatch(x, qk_weight, value_z_weight, qkv, z, stream);
+    detail::q4_q5_gdn_input_dispatch(x, qk_weight, value_z_weight, qkv, z, policy, workspace,
+                                     stream);
+}
+
+} // namespace
+
+void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                    Tensor& qkv, Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
+                    cudaStream_t stream) {
+    dispatch_two_parent(x, qk_weight, value_z_weight, qkv, z, policy, &workspace, stream);
+}
+
+void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                    Tensor& qkv, Tensor& z, cudaStream_t stream) {
+    dispatch_two_parent(x, qk_weight, value_z_weight, qkv, z, LinearPolicy::A16Only, nullptr,
+                        stream);
 }
 
 std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent_rows,
@@ -760,6 +782,11 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
         }
         return detail::fp8_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     }
+    // The Q4 query/key parent names the two-parent Q4/Q5 profile.
+    if (parent_qtype == QType::Q4G64_F16S && parent_rows == 4096 && input_rows == 5120 &&
+        policy != LinearPolicy::AllowA4) {
+        return detail::q4_q5_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+    }
     if (parent_qtype == QType::W8G32_F16S && parent_rows == 12288 && input_rows == 2048 &&
         policy == LinearPolicy::A16Only) {
         (void)detail::w8_gdn_input_resolve_plan(
@@ -783,9 +810,13 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
 }
 
 std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-    std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
+    std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows, LinearPolicy policy,
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
+    validate_policy(policy);
     const bool q4_q5 = query_rows == 2048 && key_rows == 2048 && value_rows == 6144;
+    if (policy == LinearPolicy::AllowA4 || (!q4_q5 && policy != LinearPolicy::A16Only)) {
+        throw std::invalid_argument("gdn_input_proj_conv_snapshot workspace: unsupported policy");
+    }
     const bool w8    = query_rows == 2048 && key_rows == 2048 && value_rows == 4096;
     if (!q4_q5 && !w8) {
         throw std::invalid_argument("gdn_input_proj_conv_snapshot workspace: unregistered shape");
@@ -820,6 +851,12 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     if (largest_materialized_width == 0) { return 0; }
     WorkspaceLayoutBuilder layout;
     (void)allocate_projected_workspace(layout, channels, largest_materialized_width);
+    if (q4_q5) {
+        // The materialized projection runs inside the projected-plane scope.
+        const std::size_t projection = detail::q4_q5_gdn_input_workspace_capacity_bytes(
+            policy, largest_materialized_width, largest_materialized_width);
+        if (projection != 0) { (void)layout.alloc_bytes(projection, 256); }
+    }
     return layout.peak_bytes(1);
 }
 
@@ -912,8 +949,12 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
                                   Tensor& conv_states, const Tensor& valid_columns,
                                   const Tensor& initial_state_slots,
                                   const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
-                                  Tensor& value, Tensor& z, WorkspaceArena& ws,
-                                  cudaStream_t stream) {
+                                  Tensor& value, Tensor& z, LinearPolicy policy,
+                                  WorkspaceArena& ws, cudaStream_t stream) {
+    validate_policy(policy);
+    if (policy == LinearPolicy::AllowA4) {
+        throw std::invalid_argument("Q4/Q5 gdn_input_proj_conv_snapshot admits A16Only and AllowA8");
+    }
     constexpr std::int32_t kHidden     = 5120;
     constexpr std::int32_t kQueryRows  = 2048;
     constexpr std::int32_t kKeyRows    = 2048;
@@ -956,7 +997,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
 
     auto scope                 = ws.scope();
     ProjectedWorkspace scratch = allocate_projected_workspace(ws, kChannels, geometry.width);
-    gdn_input_proj(x, qk_weight, value_z_weight, scratch.projected, z, stream);
+    gdn_input_proj(x, qk_weight, value_z_weight, scratch.projected, z, policy, ws, stream);
     detail::gdn_projected_conv_snapshot_launch(scratch.projected, conv_weight, conv_states,
                                                valid_columns, initial_state_slots,
                                                snapshot_base_slots, query, key, value, stream);

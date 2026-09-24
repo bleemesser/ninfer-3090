@@ -55,11 +55,13 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_tc
 
     static_assert(QkvRows >= Br);
 
-    // One 32-key tile of trellis streams. Streams for consecutive keys are contiguous
-    // inside a page, and a 32-key tile never straddles a 64-token page, so the whole
-    // tile is one contiguous byte range. K and V take turns in this buffer.
-    __shared__ std::uint8_t stream_s[Bc * kKVCacheTcq3RowBytes];
-    __shared__ __half norm_s[Bc * kKVCacheTcq3Groups];
+    // One 32-key tile of trellis streams and norms for both planes. Streams for consecutive
+    // keys are contiguous inside a page, and a 32-key tile never straddles a 64-token page, so
+    // each plane of the tile is one contiguous byte range, copied as 16-byte cp.async chunks.
+    constexpr int RawCodeBytes = Bc * kKVCacheTcq3RowBytes;
+    constexpr int RawNormBytes = Bc * kKVCacheTcq3Groups * static_cast<int>(sizeof(__half));
+    static_assert(RawCodeBytes % 16 == 0 && RawNormBytes % 16 == 0);
+    __shared__ __align__(16) unsigned char raw_s[2 * RawCodeBytes + 2 * RawNormBytes];
     // Both codebooks live in shared memory rather than constant memory. Constant memory
     // broadcasts one address to a warp; here every thread looks up a different trellis
     // state, so a constant-memory read serializes up to 32 ways. Shared memory only
@@ -215,7 +217,6 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_tc
                     smem_addr(&qkv_s[arow * D + causal_small_t_tc_swz(arow, acol)]));
     }
     __syncthreads();
-    int physical_page = physical_pages_s[0];
     float acc[PVNt][4];
 #pragma unroll
     for (int n = 0; n < PVNt; ++n) {
@@ -224,64 +225,86 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_tc
     }
     float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F, l0 = 0.0f, l1 = 0.0f;
 
+    // Issue the copies of tile kb into raw_s: K codes, V codes, K norms, V norms.
+    const auto issue_raw = [&](int kb) {
+        const int k0   = first_tile + kb * Bc;
+        const int page = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
+        const int off  = k0 & kPagedKVPageMask;
+        constexpr int CodeChunks = RawCodeBytes / 16;
+        constexpr int NormChunks = RawNormBytes / 16;
+        for (int item = tid; item < 2 * (CodeChunks + NormChunks); item += Threads) {
+            if (item < 2 * CodeChunks) {
+                const bool is_v = item >= CodeChunks;
+                const int chunk = is_v ? item - CodeChunks : item;
+                cp_async<16, Cache::cg>(
+                    raw_s + (is_v ? RawCodeBytes : 0) + chunk * 16,
+                    (is_v ? cache_v : cache_k) +
+                        kv_cache_tcq3_stream_index<Geometry>(page, kv_head, 0, off) + chunk * 16);
+            } else {
+                const int n     = item - 2 * CodeChunks;
+                const bool is_v = n >= NormChunks;
+                const int chunk = is_v ? n - NormChunks : n;
+                cp_async<16, Cache::cg>(
+                    raw_s + 2 * RawCodeBytes + (is_v ? RawNormBytes : 0) + chunk * 16,
+                    reinterpret_cast<const unsigned char*>(
+                        (is_v ? cache_v_norm : cache_k_norm) +
+                        kv_cache_tcq3_norm_index<Geometry>(page, kv_head, 0, off)) +
+                        chunk * 16);
+            }
+        }
+        cp_commit();
+    };
+
+    // Decode eight values of one key into a swizzled BF16 tile. Keys outside this split are
+    // zeroed so the unused tail never reaches the tensor cores.
+    const auto decode8 = [&](__nv_bfloat16* tile, bool is_key, int task, int k0) {
+        const int key_l    = task >> 5;
+        const int c        = task & 31;
+        const int d        = c << 3;
+        __nv_bfloat16* dst = &tile[key_l * D + causal_small_t_tc_swz(key_l, d)];
+        const int key      = k0 + key_l;
+        if (key < split_start || key >= split_end) {
+            store_vec(dst, make_int4(0, 0, 0, 0));
+            return;
+        }
+        const int group             = c >> 4;
+        const unsigned char* codes  = raw_s + (is_key ? 0 : RawCodeBytes);
+        const __half* norms         = reinterpret_cast<const __half*>(
+            raw_s + 2 * RawCodeBytes + (is_key ? 0 : RawNormBytes));
+        const float* codebook       = is_key ? codebook_s : codebook_s + kKVCacheTcq3States;
+        // A run of eight symbols starts on a byte boundary and spans 30 bits.
+        const int byte_off = key_l * kKVCacheTcq3RowBytes + group * kKVCacheTcq3StreamBytes +
+                             3 * (c & 15);
+        const auto* words = reinterpret_cast<const std::uint32_t*>(codes + (byte_off & ~3));
+        const std::uint32_t word = __funnelshift_r(words[0], words[1], (byte_off & 3) * 8);
+        const float norm =
+            kv_cache_tcq3_norm_scale(norms[key_l * kKVCacheTcq3Groups + group], is_key);
+        unsigned packed[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            packed[i] = pack_bf16x2(codebook[(word >> (6 * i)) & 0x1FFu] * norm,
+                                    codebook[(word >> (6 * i + 3)) & 0x1FFu] * norm);
+        }
+        store_vec(dst, make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),
+                                 static_cast<int>(packed[2]), static_cast<int>(packed[3])));
+    };
+
+    // Warps beyond the live rows only help stage and decode.
+    const bool mma_warp = warp_row0 < row_count;
+    issue_raw(0);
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = first_tile + kb * Bc;
-        if (kb != 0 && (k0 & kPagedKVPageMask) == 0) {
-            physical_page = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
-        }
-        // Stage the tile's streams into shared memory, then decode from there. Reading
-        // the packed bits straight from global costs two byte loads for each value and
-        // leaves the kernel latency bound rather than bandwidth bound.
-        const int page_off0 = k0 & kPagedKVPageMask;
-        const std::int64_t tile_stream_off =
-            kv_cache_tcq3_stream_index<Geometry>(physical_page, kv_head, 0, page_off0);
-        const std::int64_t tile_norm_off =
-            kv_cache_tcq3_norm_index<Geometry>(physical_page, kv_head, 0, page_off0);
-
-        const auto stage = [&](const std::uint8_t* streams, const __half* norms) {
-            for (int i = tid; i < Bc * kKVCacheTcq3RowBytes; i += Threads) {
-                stream_s[i] = streams[tile_stream_off + i];
-            }
-            for (int i = tid; i < Bc * kKVCacheTcq3Groups; i += Threads) {
-                norm_s[i] = norms[tile_norm_off + i];
-            }
-            __syncthreads();
-        };
-
-        const auto decode_tile = [&](__nv_bfloat16* tile, bool is_key) {
-            for (int chunk = tid; chunk < Bc * (D / 8); chunk += Threads) {
-                const int key_l = chunk / (D / 8);
-                const int d     = (chunk - key_l * (D / 8)) * 8;
-                const int key   = k0 + key_l;
-                __nv_bfloat16* dst = &tile[key_l * D + causal_small_t_tc_swz(key_l, d)];
-                if (key >= split_start && key < split_end) {
-                    const int group = d / kKVCacheTcq3Group;
-                    const int t0    = d - group * kKVCacheTcq3Group;
-                    const std::uint8_t* stream =
-                        &stream_s[key_l * kKVCacheTcq3RowBytes + group * kKVCacheTcq3StreamBytes];
-                    const float norm = kv_cache_tcq3_norm_scale(
-                        norm_s[key_l * kKVCacheTcq3Groups + group], is_key);
-                    const float* codebook =
-                        is_key ? codebook_s : codebook_s + kKVCacheTcq3States;
-                    int states[8];
-                    kv_cache_tcq3_states8(stream, t0, states);
-#pragma unroll
-                    for (int i = 0; i < 8; ++i) {
-                        dst[i] = __float2bfloat16(codebook[states[i]] * norm);
-                    }
-                } else {
-                    store_vec(dst, make_int4(0, 0, 0, 0));
-                }
-            }
-            __syncthreads();
-        };
-
-        stage(cache_k, cache_k_norm);
-        decode_tile(k_s, true);
-        stage(cache_v, cache_v_norm);
-        decode_tile(v_s, false);
-
+        // raw_s holds tile kb, and the previous tile's MMAs have finished with k_s and v_s.
+        cp_wait<0>();
         __syncthreads();
+        for (int task = tid; task < Bc * (D / 8); task += Threads) {
+            decode8(k_s, true, task, k0);
+            decode8(v_s, false, task, k0);
+        }
+        __syncthreads();
+        // raw_s is free again; fetch the next tile while this one runs through the MMAs.
+        if (kb + 1 < key_blocks) { issue_raw(kb + 1); }
+        if (!mma_warp) { continue; }
 
         float score[QKNt][4];
 #pragma unroll
@@ -399,8 +422,8 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_tc
                          vf[0], vf[1]);
             }
         }
-        __syncthreads();
     }
+    __syncthreads();
 
     if (lid == 0) {
         const int row0 = warp_row0 + gid;

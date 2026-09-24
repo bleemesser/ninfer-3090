@@ -325,6 +325,9 @@ ninfer_add_fused_linear_test(
 ninfer_add_op_test(ninfer_linear_add_nvfp4_test
   SOURCES ops/linear_add/test_nvfp4.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_linear_add_q5_a8_test
+  SOURCES ops/linear_add/test_q5_a8.cpp
+  LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_linear_add_fp8_test
   SOURCES ops/linear_add/test_fp8.cpp
   LIBRARIES ninfer_ops)
@@ -335,6 +338,10 @@ ninfer_add_fused_linear_test(
 ninfer_add_fused_linear_test(
   ninfer_linear_swiglu_q4_a16_test
   ops/linear_swiglu/test_q4_a16.cpp
+  ops/linear_swiglu/linear_swiglu_test_common.cpp)
+ninfer_add_fused_linear_test(
+  ninfer_linear_swiglu_q4_a8_test
+  ops/linear_swiglu/test_q4_a8.cpp
   ops/linear_swiglu/linear_swiglu_test_common.cpp)
 ninfer_add_fused_linear_test(
   ninfer_linear_swiglu_w8_a16_test

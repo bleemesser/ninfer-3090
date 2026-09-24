@@ -422,7 +422,8 @@ int run_batched_case(std::string_view label, std::int32_t hidden, std::int32_t v
 }
 
 int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_weight,
-                   std::int32_t tokens, std::int32_t initial_slot) {
+                   std::int32_t tokens, std::int32_t initial_slot,
+                   ops::LinearPolicy policy = ops::LinearPolicy::A16Only) {
     constexpr std::int32_t kHidden           = 5120;
     constexpr std::int32_t kValueRows        = 6144;
     constexpr std::int32_t kZRows            = 6144;
@@ -458,11 +459,11 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
     Tensor v                          = value.tensor();
     Tensor z_output                   = z.tensor();
     const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        kQueryRows, kKeyRows, kValueRows, 1, tokens, tokens);
+        kQueryRows, kKeyRows, kValueRows, policy, 1, tokens, tokens);
     WorkspaceArena workspace(std::max<std::size_t>(1, workspace_bytes));
 
     ops::gdn_input_proj_conv_snapshot(x, query_key.view(), value_z_weight.view(), conv, conv_state,
-                                      Tensor{}, initial, snapshot_base, q, k, v, z_output,
+                                      Tensor{}, initial, snapshot_base, q, k, v, z_output, policy,
                                       workspace, nullptr);
     cuda_synchronize();
 
@@ -480,13 +481,18 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
                                               token_activation, kHidden);
         });
     const std::vector<std::uint16_t> state_after = state.bits();
-    const std::string suffix                     = " Q4/Q5 A16 T=" + std::to_string(tokens) +
+    const bool a8 = policy == ops::LinearPolicy::AllowA8 && tokens >= 17;
+    const ReductionCriterion& criterion =
+        a8 ? kFp8GdnInputProjConvSnapshotA8Tolerance : kGdnInputProjConvSnapshotA16Tolerance;
+    const std::string suffix = std::string(" Q4/Q5 ") + (a8 ? "A8" : "A16") +
+                               " T=" + std::to_string(tokens) +
                                " initial=" + std::to_string(initial_slot) +
                                " base=" + std::to_string(kSnapshotBaseSlot);
-    int failures = verify_snapshot_outputs(suffix, query, key, value, kValueRows, tokens, oracle);
+    int failures =
+        verify_snapshot_outputs(suffix, query, key, value, kValueRows, tokens, oracle, criterion);
     failures += compare("snapshot state" + suffix,
                         gather_state(state_after, kChannels, kValueRows, tokens, kSnapshotBaseSlot),
-                        oracle.state, kGdnInputProjConvSnapshotA16Tolerance);
+                        oracle.state, criterion);
     failures += state.verify_guards("snapshot state" + suffix);
     failures += verify_state_effects("snapshot state" + suffix, state_before, state_after,
                                      kChannels, tokens, slots, kSnapshotBaseSlot);
@@ -495,7 +501,7 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
     failures += compare(
         "snapshot z" + suffix, gather_rows(z.values(), kZRows, 0, kZRows, tokens),
         projection_oracle(value_z_weight.host, kValueRows, kZRows, activation, kHidden, tokens),
-        kGdnInputProjConvSnapshotA16Tolerance);
+        criterion);
     failures += verify_preserved("snapshot x" + suffix, device_activation, activation_bits);
     failures +=
         verify_preserved("snapshot conv weight" + suffix, device_conv_weight, conv_weight_bits);
@@ -523,12 +529,16 @@ int run_q4_q5() {
         const std::int32_t initial_slot = tokens == 5 ? 0 : tokens + 1;
         failures += run_q4_q5_case(query_key, value_z_weight, tokens, initial_slot);
     }
+    // AllowA8 keeps A16 through W=16 and projects through INT8 activations from W=17.
+    for (const std::int32_t tokens : {16, 17, 130}) {
+        failures += run_q4_q5_case(query_key, value_z_weight, tokens, 0, ops::LinearPolicy::AllowA8);
+    }
     constexpr std::int32_t kValueRows    = 6144;
     constexpr std::int32_t kZRows        = 6144;
     constexpr std::int32_t kChannels     = 10240;
     const std::vector<float> conv_weight = make_conv_weight(kChannels, 631U);
     const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        kQueryRows, kKeyRows, kValueRows, 8, 1, 1);
+        kQueryRows, kKeyRows, kValueRows, ops::LinearPolicy::A16Only, 8, 1, 1);
     failures += run_batched_case(
         "Q4/Q5 A16 B=8 W=1", kHidden, kValueRows, kZRows, 1, 8, {}, conv_weight, workspace_bytes,
         kGdnInputProjConvSnapshotA16Tolerance,
@@ -550,7 +560,7 @@ int run_q4_q5() {
             const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
             Tensor& z, WorkspaceArena& workspace) {
             ops::gdn_input_proj_conv_snapshot(x, query_key.view(), value_z_weight.view(), conv,
-                                              state, valid, initial, snapshot_base, q, k, v, z,
+                                              state, valid, initial, snapshot_base, q, k, v, z, ops::LinearPolicy::A16Only,
                                               workspace, nullptr);
         });
     failures += query_key.verify_preserved("batched Q4/Q5 query/key weight");
@@ -594,7 +604,7 @@ int run_w8_case(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t in
     Tensor v                          = value.tensor();
     Tensor z_output                   = z.tensor();
     const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        kQueryRows, kKeyRows, kValueRows, 1, tokens, tokens);
+        kQueryRows, kKeyRows, kValueRows, ops::LinearPolicy::A16Only, 1, tokens, tokens);
     WorkspaceArena workspace(std::max<std::size_t>(1, workspace_bytes));
 
     ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, conv_state, Tensor{}, initial,
@@ -659,7 +669,7 @@ int run_w8() {
     const std::vector<std::int32_t> valid_columns{16, 7};
     const std::vector<float> conv_weight = make_conv_weight(kChannels, 733U);
     const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        kQueryRows, kKeyRows, kValueRows, kBatch, kWidth, kWidth);
+        kQueryRows, kKeyRows, kValueRows, ops::LinearPolicy::A16Only, kBatch, kWidth, kWidth);
     failures += run_batched_case(
         "W8 A16 B=2 W=16 masked", kHidden, kValueRows, kZRows, kWidth, kBatch, valid_columns,
         conv_weight, workspace_bytes, kGdnInputProjConvSnapshotA16Tolerance,
@@ -1010,19 +1020,19 @@ int main() {
 
     int failures = 0;
     const std::size_t q4_interval =
-        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, 1, 1, 6);
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, ops::LinearPolicy::A16Only, 1, 1, 6);
     const std::size_t q4_witness =
-        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, 1, 4, 4);
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, ops::LinearPolicy::A16Only, 1, 4, 4);
     const std::size_t q4_right_endpoint =
-        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, 1, 6, 6);
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, ops::LinearPolicy::A16Only, 1, 6, 6);
     if (q4_interval != q4_witness || q4_witness == 0 || q4_right_endpoint != 0) {
         std::cerr << "Q4/Q5 snapshot interval did not retain its non-monotonic T=4 route\n";
         ++failures;
     }
-    if (ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 1, 16) !=
+    if (ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, ops::LinearPolicy::A16Only, 1, 1, 16) !=
             0 ||
-        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 1, 17) !=
-            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 17,
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, ops::LinearPolicy::A16Only, 1, 1, 17) !=
+            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, ops::LinearPolicy::A16Only, 1, 17,
                                                                        17)) {
         std::cerr << "W8 snapshot interval did not preserve its zero/nonzero route boundary\n";
         ++failures;

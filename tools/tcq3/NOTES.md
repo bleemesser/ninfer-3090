@@ -195,3 +195,30 @@ Modes are turbo for 262144 context, speed for 65536, and int8 for the faster
 prefill that cannot reach full context. Vision and MTP are on in every mode, and
 concurrency is pinned to 1 because MTP is single-sequence and because pooled
 slots overrun one KV cache.
+
+## Speed work, 2026-09-23
+
+Measured with `ninfer_bench`: 262144 context, prefill chunk 1024, MTP with three draft
+tokens and the LM-head draft, three repetitions.
+
+| Test | Before | After |
+|---|---:|---:|
+| pp512 | 1048 | 2509 |
+| pp4096 | 1032 | 2451 |
+| pp16384 | 911 | 2202 |
+| pp65536 | 621 | 1566 |
+| decode after 16384 | 100.1 | 142.8 |
+
+Four changes carry this:
+
+- The prompt attention kernel prefetches compressed tiles with cp.async, decodes from shared
+  memory, and splits 16 warps into QK producers and V decoders. It is 2.6 times faster at 16384
+  tokens.
+- The Viterbi encoder uses one warp for each group instead of a 512-thread block. It is 3.6
+  times faster and still matches the host encoder byte for byte.
+- Prefill projections quantize activations to INT8 for each 64-value group and use INT8 MMA.
+- Small-T projections and the decode attention kernel now stream from memory instead of
+  staging serially.
+
+Perplexity is 6.404815 on wikitext 00.txt at context 2048 and stride 1024. On the same text, the
+earlier A16 build scores 6.419089 and INT8 KV scores 6.384948.

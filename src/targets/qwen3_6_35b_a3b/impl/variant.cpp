@@ -277,7 +277,8 @@ std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(Weig
                                                                             std::int32_t first,
                                                                             std::int32_t last) {
     return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, batch_size, first, last);
+        TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, ops::LinearPolicy::A16Only,
+        batch_size, first, last);
 }
 
 std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(WeightsProfile,
